@@ -23,7 +23,7 @@
 #include <cstdarg>
 
 EmmyFacade* EmmyFacade::Get() {
-	static EmmyFacade instance;
+	static thread_local EmmyFacade instance;
 	return &instance;
 }
 
@@ -31,7 +31,8 @@ EmmyFacade::EmmyFacade():
 	transporter(nullptr),
 	isIDEReady(false),
 	isAPIReady(false),
-	isWaitingForIDE(false) {
+	isWaitingForIDE(false),
+	isOpenDebugLog(false) {
 }
 
 EmmyFacade::~EmmyFacade() {
@@ -160,6 +161,21 @@ void EmmyFacade::Destroy() {
 		transporter = nullptr;
 	}
 }
+void EmmyFacade::Tick() {
+	if (transporter) {
+		transporter->EventLoop();
+	}
+}
+void EmmyFacade::ThreadSafe() {
+	if (transporter) {
+		transporter->threadSafe = true;
+	}
+}
+void EmmyFacade::OpenDebugLog()
+{
+	isOpenDebugLog = true;
+}
+
 
 void EmmyFacade::OnReceiveMessage(const rapidjson::Document& document) {
 	const auto cmd = static_cast<MessageCMD>(document["cmd"].GetInt());
@@ -388,6 +404,7 @@ void EmmyFacade::OnEvalResult(EvalContext* context) {
 }
 
 void EmmyFacade::SendLog(LogType type, const char *fmt, ...) {
+	if (!isOpenDebugLog &&  type == LogType::Debug)return;
 	va_list args;
 	va_start(args, fmt);
 	char buff[1024] = { 0 };

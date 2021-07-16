@@ -48,6 +48,7 @@ SocketServerTransporter::~SocketServerTransporter() {
 bool SocketServerTransporter::Listen(const std::string& host, int port, std::string& err) {
 	sockaddr_in addr{};
 	uvServer.data = this;
+	this->port = port;
 	uv_tcp_init(loop, &uvServer);
 	uv_ip4_addr(host.c_str(), port, &addr);
 	uv_tcp_bind(&uvServer, reinterpret_cast<const struct sockaddr*>(&addr), 0);
@@ -56,6 +57,11 @@ bool SocketServerTransporter::Listen(const std::string& host, int port, std::str
 		err = uv_strerror(r);
 		return false;
 	}
+	auto closeCb= [](uv_handle_t* handle) {
+		printf("SocketServerTransporter::Close %d\n", ((SocketServerTransporter*)handle->data)->port);
+	};
+	uvServer.close_cb = closeCb;
+	printf("SocketServerTransporter::Listen %d\n", port);
 	StartEventLoop();
 	return true;
 }

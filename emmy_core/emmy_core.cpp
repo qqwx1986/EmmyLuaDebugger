@@ -15,7 +15,6 @@
 */
 #include "emmy_core.h"
 #include "emmy_facade.h"
-
 int luaopen_emmy_helper(lua_State* L);
 
 // emmy.tcpListen(host: string, port: int): bool
@@ -91,7 +90,18 @@ int stop(lua_State* L) {
 	EmmyFacade::Get()->Destroy();
 	return 0;
 }
-
+int threadSafe(lua_State* L) {
+	EmmyFacade::Get()->ThreadSafe();
+	return 0;
+}
+int tick(lua_State* L) {
+	EmmyFacade::Get()->Tick();
+	return 0;
+}
+int openLog(lua_State* L) {
+	EmmyFacade::Get()->OpenDebugLog();
+	return 0;
+}
 int gc(lua_State* L) {
 	EmmyFacade::Get()->OnLuaStateGC(L);
 	return 0;
@@ -119,6 +129,9 @@ static const luaL_Reg lib[] = {
 	{"waitIDE", waitIDE},
 	{"breakHere", breakHere},
 	{"stop", stop},
+	{"threadSafe",threadSafe},
+	{"tick",tick},
+	{"openLog",openLog},
 	{nullptr, nullptr}
 };
 

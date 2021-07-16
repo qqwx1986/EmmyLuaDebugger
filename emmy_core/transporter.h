@@ -17,6 +17,7 @@
 #include "uv.h"
 #include "rapidjson/document.h"
 #include <thread>
+#include <concurrent_queue.h>
 
 class EmmyFacade;
 
@@ -51,7 +52,6 @@ enum class MessageCMD {
 	// debugger -> ide
 	LogNotify,
 };
-
 class Transporter {
 	EmmyFacade* facade;
 	std::thread thread;
@@ -62,9 +62,12 @@ class Transporter {
 	bool running;
 	bool connected;
 	bool serverMode;
+	Concurrency::concurrent_queue<rapidjson::Document*> serverRecvMsg;
 protected:
 	uv_loop_t* loop;
+	int port;
 public:
+	bool threadSafe;
 	Transporter(bool server);
 	virtual ~Transporter();
 	virtual int Stop();
@@ -73,6 +76,8 @@ public:
 	void Send(int cmd, const rapidjson::Document& document);
 	void SetHandler(EmmyFacade* facade);
 	void OnAfterRead(uv_stream_t* handle, ssize_t nread, const uv_buf_t* buf);
+	// Signal Thread
+	void EventLoop();
 protected:
 	virtual void Send(int cmd, const char* data, size_t len) = 0;
 	void Send(uv_stream_t* handler, int cmd, const char* data, size_t len);

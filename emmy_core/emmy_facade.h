@@ -24,7 +24,7 @@ class Transporter;
 class EvalContext;
 
 enum class LogType {
-	Info, Warning, Error
+	Debug, Info, Warning, Error
 };
 
 class EmmyFacade {
@@ -36,6 +36,7 @@ class EmmyFacade {
 	bool isIDEReady;
 	bool isAPIReady;
 	bool isWaitingForIDE;
+	bool isOpenDebugLog;
 public:
 	static EmmyFacade* Get();
 	EmmyFacade();
@@ -57,6 +58,9 @@ public:
 	void OnEvalResult(EvalContext* context);
 	void SendLog(LogType type, const char *fmt, ...);
 	void OnLuaStateGC(lua_State* L);
+	void Tick();
+	void ThreadSafe();
+	void OpenDebugLog();
 private:
 	void OnInitReq(const rapidjson::Document& document);
 	void OnReadyReq(const rapidjson::Document& document);

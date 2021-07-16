@@ -82,6 +82,7 @@ void SocketClientTransporter::OnConnection(uv_connect_t* req, int status) {
 		uv_read_start((uv_stream_t*)&uvClient, echo_alloc, after_read);
 	}
 	else {
+		printf("SocketClientTransporter::OnConnection\n");
 		Stop();
 		OnConnect(false);
 	}
