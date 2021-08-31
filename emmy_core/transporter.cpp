@@ -22,25 +22,25 @@
 #include <type_traits>
 static void log(const std::string& info)
 {
-	printf("EmmyLuaDebugLog : %s", info.c_str());
-	static std::string FinalFile;
-	static struct Init {
-		Init() {
-			std::string File = "d:/emmy1.txt";
-			auto f = fopen(File.c_str(), "r");
-			if (f) {
-				FinalFile = "d:/emmy2.txt";
-				fclose(f);
-			}
-			else {
-				FinalFile = File;
-			}
-		}
-	} _;
-
-	auto f = ::fopen(FinalFile.c_str(), "a+");
-	fwrite(info.c_str(), 1, info.size(), f);
-	fclose(f);
+	// printf("EmmyLuaDebugLog : %s", info.c_str());
+	// static std::string FinalFile;
+	// static struct Init {
+	// 	Init() {
+	// 		std::string File = "d:/emmy1.txt";
+	// 		auto f = fopen(File.c_str(), "r");
+	// 		if (f) {
+	// 			FinalFile = "d:/emmy2.txt";
+	// 			fclose(f);
+	// 		}
+	// 		else {
+	// 			FinalFile = File;
+	// 		}
+	// 	}
+	// } _;
+	//
+	// auto f = ::fopen(FinalFile.c_str(), "a+");
+	// fwrite(info.c_str(), 1, info.size(), f);
+	// fclose(f);
 }
 Transporter::Transporter(bool server):
 	facade(nullptr),
