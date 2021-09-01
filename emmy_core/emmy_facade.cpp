@@ -21,6 +21,7 @@
 #include "proto/pipeline_server_transporter.h"
 #include "proto/pipeline_client_transporter.h"
 #include <cstdarg>
+#include <DbgHelp.h>
 
 EmmyFacade* EmmyFacade::Get() {
 	static thread_local EmmyFacade instance;
@@ -147,6 +148,13 @@ int EmmyFacade::OnConnect(bool suc) {
 }
 
 int EmmyFacade::OnDisconnect() {
+	extern volatile DWORD UeMainThreadID;
+	extern volatile HANDLE UeMainProcess;
+	if (UeMainThreadID != 0 && UeMainProcess)
+	{
+		SymCleanup(UeMainProcess);
+	}
+	
 	isIDEReady = false;
 	isWaitingForIDE = false;
 	Debugger::Get()->Stop();

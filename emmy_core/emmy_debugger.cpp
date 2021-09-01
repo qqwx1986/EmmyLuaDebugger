@@ -162,10 +162,15 @@ static std::string GetParentDirectory(const std::string &Path)
 	return (std::string::npos == Pos) ? "" : Path.substr(0, Pos);
 }
 
-static bool HasIndexOf(const std::string &Path, const std::string &End)
+static bool HasIndexOf(const std::string &Path, const std::string &Find)
 {
-	size_t Pos = Path.rfind(End);
+	size_t Pos = Path.rfind(Find);
 	return std::string::npos != Pos;
+}
+
+static bool StartsWith(const std::string &Path, const std::string &Find)
+{
+	return Path.rfind(Find) == 0;
 }
 
 static bool EndsWith(const std::string &Path, const std::initializer_list<std::string> &List)
@@ -186,33 +191,47 @@ static bool EndsWith(const std::string &Path, const std::initializer_list<std::s
 	return false;
 }
 
-static void InitSymbol(HANDLE Process)
+volatile DWORD UeMainThreadID = 0;
+volatile HANDLE UeMainProcess = nullptr;
+
+static void InitSymbol()
 {
-	uint32_t SymOpts = SymGetOptions();
-	SymOpts |= SYMOPT_LOAD_LINES | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_DEFERRED_LOADS | SYMOPT_EXACT_SYMBOLS;
-	SymSetOptions(SymOpts);
-	
-	std::set<std::string> Paths;
-	char Path[MAX_PATH] = {0};
-	if (::GetCurrentDirectoryA(sizeof(Path), Path))
+	if (UeMainThreadID != 0 && UeMainProcess)
 	{
-		Paths.emplace(Path);
+		return;
 	}
 
-	{ // 查询当前进程所有的 dll
-		const DWORD ProcessID = GetProcessId(Process);
-		const HANDLE Snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, ProcessID);
-		if (Snapshot != INVALID_HANDLE_VALUE)
+	UeMainThreadID = GetCurrentThreadId();
+	UeMainProcess = GetCurrentProcess();
+	
+	uint32_t SymOpts = SymGetOptions();
+	SymOpts |= SYMOPT_LOAD_LINES | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_DEFERRED_LOADS | SYMOPT_DEBUG | SYMOPT_IGNORE_NT_SYMPATH;
+	SymSetOptions(SymOpts);
+	
+	static std::set<std::string> Paths;
+	if (Paths.size() == 0)
+	{
+		char Path[MAX_PATH] = {0};
+		if (::GetCurrentDirectoryA(sizeof(Path), Path))
 		{
-			MODULEENTRY32  Module32;
-			Module32.dwSize = sizeof(MODULEENTRY32);
-			BOOL bRet = Module32First(Snapshot, &Module32);
-			while(bRet)
+			Paths.emplace(Path);
+		}
+
+		{ // 查询当前进程所有的 dll
+			const DWORD ProcessID = GetProcessId(UeMainProcess);
+			const HANDLE Snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, ProcessID);
+			if (Snapshot != INVALID_HANDLE_VALUE)
 			{
-				Paths.emplace(GetParentDirectory(Module32.szExePath)); 
-				bRet = Module32Next(Snapshot, &Module32); 
+				MODULEENTRY32  Module32;
+				Module32.dwSize = sizeof(MODULEENTRY32);
+				BOOL bRet = Module32First(Snapshot, &Module32);
+				while(bRet)
+				{
+					Paths.emplace(GetParentDirectory(Module32.szExePath)); 
+					bRet = Module32Next(Snapshot, &Module32); 
+				}
+				CloseHandle(Snapshot);
 			}
-			CloseHandle(Snapshot);
 		}
 	}
 
@@ -222,7 +241,7 @@ static void InitSymbol(HANDLE Process)
 		SymbolPath += Pa;
 		SymbolPath += ";";
 	}
-	SymInitialize(Process, SymbolPath.c_str(), TRUE);
+	SymInitialize(UeMainProcess, SymbolPath.c_str(), TRUE);
 }
 
 static void DoStackWork(HANDLE Process, HANDLE ThreadHandle, CONTEXT &Context, std::vector<Stack*>& Stacks, StackAllocatorCB Alloc)
@@ -241,20 +260,32 @@ static void DoStackWork(HANDLE Process, HANDLE ThreadHandle, CONTEXT &Context, s
 		TCHAR szBuffer[MAX_PATH];
 	} SYMBOL_INFO, * LPSYMBOL_INFO;
 
-	std::set<std::string> Ignored = {
-		"GetUeTraceStackInGameThread", "GetUeTraceStack", "Debugger::GetStacks", "EmmyFacade::OnBreak", "Debugger::HandleBreak", "Debugger::Hook", "HookLua"
+	static const std::set<std::string> Ignored = {
+		"GetUeTraceStackInGameThread",
+		"GetUeTraceStack",
+		"Debugger::GetStacks",
+		"EmmyFacade::OnBreak",
+		"Debugger::HandleBreak",
+		"Debugger::Hook",
+		"HookLua",
+		"NtGetContextThread",
+		"CallWindowProcW",
+		"DispatchMessageW",
+		"BaseThreadInitThunk",
+		"RtlUserThreadStart"
 	};
 	
 	SYMBOL_INFO StackInfo = {0};
 	int SameLua = 0;
-	
+
+	char Name[MAX_PATH];
 	for (int Depth = 0; Depth < 64; ++Depth)
 	{
 		if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, Process, ThreadHandle, &StackFrame64, &Context, nullptr,
 		                 SymFunctionTableAccess64,
 		                 SymGetModuleBase64, nullptr))
 		{
-			continue;
+			break;
 		}
 
 		memset(&StackInfo, 0, sizeof(StackInfo));
@@ -273,10 +304,23 @@ static void DoStackWork(HANDLE Process, HANDLE ThreadHandle, CONTEXT &Context, s
 		{
 			continue;
 		}
+
+		if (Ignored.find(Symbol->Name) != Ignored.end())
+		{
+			continue;
+		}
 		
+		snprintf(Name, sizeof(Name), "%s()", Symbol->Name);
+		if (StartsWith(Name, "lua"))
+		{
+			if (SameLua % 2 == 0)
+			{
+				continue;
+			}
+		}
 		BOOL bLineFromAddr64 = SymGetLineFromAddr64(Process, StackFrame64.AddrPC.Offset, &DisplacementLine, &Line);
 		Stack* St = Alloc();
-		St->functionName = Symbol->Name;
+		St->functionName = Name;
 		St->file = "[unknown]";
 		if (bLineFromAddr64 && !HasIndexOf(Line.FileName, "\\emmy_core\\"))
 		{
@@ -308,8 +352,6 @@ static void DoStackWork(HANDLE Process, HANDLE ThreadHandle, CONTEXT &Context, s
 		}
 		Stacks.push_back(St);
 	}
-
-	SymCleanup(Process);
 }
 
 static void GetUeTraceStackInGameThread(HANDLE Process, HANDLE ThreadHandle, DWORD ThreadID, std::vector<Stack*>& Stacks, StackAllocatorCB Alloc)
@@ -326,9 +368,7 @@ static void GetUeTraceStackInGameThread(HANDLE Process, HANDLE ThreadHandle, DWO
 
 static void GetUeTraceStack(std::vector<Stack*>& Stacks, StackAllocatorCB Alloc)
 {
-	extern volatile DWORD UeMainThreadID;
-	extern volatile HANDLE UeMainProcess;
-	InitSymbol(UeMainProcess);
+	InitSymbol();
 	if (UeMainThreadID == GetCurrentThreadId())
 	{
 		GetUeTraceStackInGameThread(UeMainProcess, GetCurrentThread(), GetCurrentThreadId(), Stacks, Alloc);
