@@ -153,6 +153,8 @@ int EmmyFacade::OnDisconnect() {
 	if (UeMainThreadID != 0 && UeMainProcess)
 	{
 		SymCleanup(UeMainProcess);
+		UeMainThreadID = 0;
+		UeMainProcess = nullptr;
 	}
 	
 	isIDEReady = false;
