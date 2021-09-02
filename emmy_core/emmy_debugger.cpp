@@ -168,9 +168,16 @@ static bool HasIndexOf(const std::string &Path, const std::string &Find)
 	return std::string::npos != Pos;
 }
 
-static bool StartsWith(const std::string &Path, const std::string &Find)
+static bool StartsWith(const std::string &Path, const std::initializer_list<std::string> &List)
 {
-	return Path.rfind(Find) == 0;
+	for (const std::string& One : List)
+	{
+		if (Path.find(One) == 0)
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 static bool EndsWith(const std::string &Path, const std::initializer_list<std::string> &List)
@@ -244,7 +251,9 @@ static void InitSymbol()
 	SymInitialize(UeMainProcess, SymbolPath.c_str(), TRUE);
 }
 
-static void DoStackWork(HANDLE Process, HANDLE ThreadHandle, CONTEXT &Context, std::vector<Stack*>& Stacks, StackAllocatorCB Alloc)
+static Stack None;
+
+static void DoStackWalk(HANDLE Process, HANDLE ThreadHandle, CONTEXT &Context, std::queue<Stack*>& Stacks, StackAllocatorCB Alloc)
 {
 	STACKFRAME64 StackFrame64 = {};
 	StackFrame64.AddrPC.Offset = Context.Rip;
@@ -276,9 +285,7 @@ static void DoStackWork(HANDLE Process, HANDLE ThreadHandle, CONTEXT &Context, s
 	};
 	
 	SYMBOL_INFO StackInfo = {0};
-	int SameLua = 0;
 
-	char Name[MAX_PATH];
 	for (int Depth = 0; Depth < 64; ++Depth)
 	{
 		if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, Process, ThreadHandle, &StackFrame64, &Context, nullptr,
@@ -310,89 +317,66 @@ static void DoStackWork(HANDLE Process, HANDLE ThreadHandle, CONTEXT &Context, s
 			continue;
 		}
 		
-		snprintf(Name, sizeof(Name), "%s()", Symbol->Name);
-		if (StartsWith(Name, "lua"))
+		if (StartsWith(Symbol->Name, {"lua_", "luaopen_"}))
 		{
-			if (SameLua % 2 == 0)
+			if (Stacks.size() > 0 && Stacks.back() != &None)
 			{
-				continue;
+				Stacks.push(&None);
 			}
+			continue;
 		}
 		BOOL bLineFromAddr64 = SymGetLineFromAddr64(Process, StackFrame64.AddrPC.Offset, &DisplacementLine, &Line);
 		Stack* St = Alloc();
-		St->functionName = Name;
+		St->functionName = Symbol->Name;
 		St->file = "[unknown]";
-		if (bLineFromAddr64 && !HasIndexOf(Line.FileName, "\\emmy_core\\"))
+		if (bLineFromAddr64)
 		{
-			if (EndsWith(Line.FileName, {".cpp", ".h", ".hpp", ".inl", ".c",}))
-			{
-				if (SameLua % 2 == 0)
-				{
-					Stack* StCall = Alloc();
-					StCall->file = "[lua-vm] ";
-					StCall->functionName = "C/C++ call Lua";
-					Stacks.push_back(StCall);
-					++SameLua;
-				}
-			}
-			else if (EndsWith(Line.FileName, {".lua"}))
-			{
-				if (SameLua % 2 == 1)
-				{
-					Stack* StCall = Alloc();
-					StCall->file = "[ lua-vm] ";
-					StCall->functionName = "Lua call C/C++";
-					Stacks.push_back(StCall);
-					++SameLua;
-				}
-			}
-			
 			St->file = Line.FileName;
 			St->line = Line.LineNumber;
 		}
-		Stacks.push_back(St);
+		Stacks.push(St);
 	}
 }
 
-static void GetUeTraceStackInGameThread(HANDLE Process, HANDLE ThreadHandle, DWORD ThreadID, std::vector<Stack*>& Stacks, StackAllocatorCB Alloc)
-{
-	CONTEXT Context = {};
-	Context.ContextFlags = CONTEXT_CONTROL;
-	if (!GetThreadContext(ThreadHandle, &Context))
-	{
-		return;
-	}
-	
-	DoStackWork(Process, ThreadHandle, Context, Stacks, Alloc);
-}
-
-static void GetUeTraceStack(std::vector<Stack*>& Stacks, StackAllocatorCB Alloc)
+static void GetUeTraceStack(std::queue<Stack*>& Stacks, StackAllocatorCB Alloc)
 {
 	InitSymbol();
+	const HANDLE CurrentThread = GetCurrentThread();
+	HANDLE UeMainThread = nullptr;
+	CONTEXT Context = {};
+	memset(&Context, 0, sizeof(Context));
+	
 	if (UeMainThreadID == GetCurrentThreadId())
 	{
-		GetUeTraceStackInGameThread(UeMainProcess, GetCurrentThread(), GetCurrentThreadId(), Stacks, Alloc);
-		return;
+		UeMainThread = CurrentThread;
+		RtlCaptureContext(&Context);
 	}
-	const HANDLE UeMainHandle = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_TERMINATE | THREAD_SUSPEND_RESUME, false, UeMainThreadID);
-	if (UeMainHandle)
+	else
 	{
-		SuspendThread(UeMainHandle);
-		CONTEXT ThreadContext = {};
-		ThreadContext.ContextFlags = CONTEXT_CONTROL;
-		if (!GetThreadContext(UeMainHandle, &ThreadContext))
-		{
-			return;
-		}
-		DoStackWork(UeMainProcess, UeMainHandle, ThreadContext, Stacks, Alloc);
-		ResumeThread(UeMainHandle);
-		CloseHandle(UeMainHandle);
+		UeMainThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_TERMINATE | THREAD_SUSPEND_RESUME, false, UeMainThreadID);
+		SuspendThread(UeMainThread);
+		GetThreadContext(UeMainThread, &Context);
 	}
+	
+	DoStackWalk(UeMainProcess, UeMainThread, Context, Stacks, Alloc);
+	if (CurrentThread != UeMainThread)
+	{
+		ResumeThread(UeMainThread);
+		CloseHandle(UeMainThread);
+	}
+}
+
+static bool IsCxxFunction(const std::string &Name)
+{
+	return Name == "=[C]";
 }
 
 bool Debugger::GetStacks(lua_State* L, std::vector<Stack*>& stacks, StackAllocatorCB alloc) {
+	std::queue<Stack*> CxxStacks;
+	GetUeTraceStack(CxxStacks, alloc);
 	int level = 0;
-	while (true) {
+	while (true)
+	{
 		lua_Debug ar{};
 		if (!lua_getstack(L, level, &ar)) {
 			break;
@@ -400,11 +384,39 @@ bool Debugger::GetStacks(lua_State* L, std::vector<Stack*>& stacks, StackAllocat
 		if (!lua_getinfo(L, "nSlu", &ar)) {
 			continue;
 		}
+		const std::string FileName = GetFile(L, &ar);
+		if (IsCxxFunction(FileName))
+		{
+			{
+				auto* stack = alloc();
+				stack->file = "[C->Lua]";
+				stack->functionName = "lua_pcall";
+				stack->line = -1;
+				stacks.push_back(stack);
+			}
+			do
+			{
+				Stack* front = CxxStacks.front();
+				if (front == &None)
+				{
+					CxxStacks.pop();
+					break;
+				}
+				stacks.push_back(front);
+				CxxStacks.pop();
+			}
+			while (!CxxStacks.empty());
+			
+		}
 		auto* stack = alloc();
 		stack->file = GetFile(L, &ar);
 		stack->functionName = getDebugName(&ar) == nullptr ? "" : getDebugName(&ar);
 		stack->level = level;
 		stack->line = getDebugCurrentLine(&ar);
+		if (IsCxxFunction(FileName))
+		{
+			stack->file = "[Lua->C]";
+		}
 		stacks.push_back(stack);
 		// get variables
 		{
@@ -449,7 +461,29 @@ bool Debugger::GetStacks(lua_State* L, std::vector<Stack*>& stacks, StackAllocat
 		level++;
 	}
 
-	GetUeTraceStack(stacks, alloc);
+	if (!CxxStacks.empty())
+	{
+		{
+			auto* stack = alloc();
+			stack->file = "[C->Lua]";
+			stack->functionName = "lua_pcall";
+			stack->line = -1;
+			stacks.push_back(stack);
+		}
+		while (!CxxStacks.empty())
+		{
+			Stack * stack = CxxStacks.front();
+			if (stack == &None)
+			{
+				stack = alloc();
+				stack->file = "[C->Lua]";
+				stack->functionName = "lua_pcall";
+				stack->line = -1;
+			}
+			stacks.push_back(stack);
+			CxxStacks.pop();
+		}
+	}
 	return false;
 }
 
