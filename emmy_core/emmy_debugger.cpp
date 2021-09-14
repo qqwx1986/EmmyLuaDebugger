@@ -162,10 +162,22 @@ static std::string GetParentDirectory(const std::string &Path)
 	return (std::string::npos == Pos) ? "" : Path.substr(0, Pos);
 }
 
-static bool HasIndexOf(const std::string &Path, const std::string &End)
+static bool HasIndexOf(const std::string &Path, const std::string &Find)
 {
-	size_t Pos = Path.rfind(End);
+	size_t Pos = Path.rfind(Find);
 	return std::string::npos != Pos;
+}
+
+static bool StartsWith(const std::string &Path, const std::initializer_list<std::string> &List)
+{
+	for (const std::string& One : List)
+	{
+		if (Path.find(One) == 0)
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 static bool EndsWith(const std::string &Path, const std::initializer_list<std::string> &List)
@@ -186,33 +198,47 @@ static bool EndsWith(const std::string &Path, const std::initializer_list<std::s
 	return false;
 }
 
-static void InitSymbol(HANDLE Process)
+volatile DWORD UeMainThreadID = 0;
+volatile HANDLE UeMainProcess = nullptr;
+
+static void InitSymbol()
 {
-	uint32_t SymOpts = SymGetOptions();
-	SymOpts |= SYMOPT_LOAD_LINES | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_DEFERRED_LOADS | SYMOPT_EXACT_SYMBOLS;
-	SymSetOptions(SymOpts);
-	
-	std::set<std::string> Paths;
-	char Path[MAX_PATH] = {0};
-	if (::GetCurrentDirectoryA(sizeof(Path), Path))
+	if (UeMainThreadID != 0 && UeMainProcess)
 	{
-		Paths.emplace(Path);
+		return;
 	}
 
-	{ // 查询当前进程所有的 dll
-		const DWORD ProcessID = GetProcessId(Process);
-		const HANDLE Snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, ProcessID);
-		if (Snapshot != INVALID_HANDLE_VALUE)
+	UeMainThreadID = GetCurrentThreadId();
+	UeMainProcess = GetCurrentProcess();
+	
+	uint32_t SymOpts = SymGetOptions();
+	SymOpts |= SYMOPT_LOAD_LINES | SYMOPT_FAIL_CRITICAL_ERRORS | SYMOPT_DEFERRED_LOADS | SYMOPT_DEBUG | SYMOPT_IGNORE_NT_SYMPATH;
+	SymSetOptions(SymOpts);
+	
+	static std::set<std::string> Paths;
+	if (Paths.size() == 0)
+	{
+		char Path[MAX_PATH] = {0};
+		if (::GetCurrentDirectoryA(sizeof(Path), Path))
 		{
-			MODULEENTRY32  Module32;
-			Module32.dwSize = sizeof(MODULEENTRY32);
-			BOOL bRet = Module32First(Snapshot, &Module32);
-			while(bRet)
+			Paths.emplace(Path);
+		}
+
+		{ // 查询当前进程所有的 dll
+			const DWORD ProcessID = GetProcessId(UeMainProcess);
+			const HANDLE Snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, ProcessID);
+			if (Snapshot != INVALID_HANDLE_VALUE)
 			{
-				Paths.emplace(GetParentDirectory(Module32.szExePath)); 
-				bRet = Module32Next(Snapshot, &Module32); 
+				MODULEENTRY32  Module32;
+				Module32.dwSize = sizeof(MODULEENTRY32);
+				BOOL bRet = Module32First(Snapshot, &Module32);
+				while(bRet)
+				{
+					Paths.emplace(GetParentDirectory(Module32.szExePath)); 
+					bRet = Module32Next(Snapshot, &Module32); 
+				}
+				CloseHandle(Snapshot);
 			}
-			CloseHandle(Snapshot);
 		}
 	}
 
@@ -222,10 +248,12 @@ static void InitSymbol(HANDLE Process)
 		SymbolPath += Pa;
 		SymbolPath += ";";
 	}
-	SymInitialize(Process, SymbolPath.c_str(), TRUE);
+	SymInitialize(UeMainProcess, SymbolPath.c_str(), TRUE);
 }
 
-static void DoStackWork(HANDLE Process, HANDLE ThreadHandle, CONTEXT &Context, std::vector<Stack*>& Stacks, StackAllocatorCB Alloc)
+static Stack None;
+
+static void DoStackWalk(HANDLE Process, HANDLE ThreadHandle, CONTEXT &Context, std::queue<Stack*>& Stacks, StackAllocatorCB Alloc)
 {
 	STACKFRAME64 StackFrame64 = {};
 	StackFrame64.AddrPC.Offset = Context.Rip;
@@ -241,20 +269,30 @@ static void DoStackWork(HANDLE Process, HANDLE ThreadHandle, CONTEXT &Context, s
 		TCHAR szBuffer[MAX_PATH];
 	} SYMBOL_INFO, * LPSYMBOL_INFO;
 
-	std::set<std::string> Ignored = {
-		"GetUeTraceStackInGameThread", "GetUeTraceStack", "Debugger::GetStacks", "EmmyFacade::OnBreak", "Debugger::HandleBreak", "Debugger::Hook", "HookLua"
+	static const std::set<std::string> Ignored = {
+		"GetUeTraceStackInGameThread",
+		"GetUeTraceStack",
+		"Debugger::GetStacks",
+		"EmmyFacade::OnBreak",
+		"Debugger::HandleBreak",
+		"Debugger::Hook",
+		"HookLua",
+		"NtGetContextThread",
+		"CallWindowProcW",
+		"DispatchMessageW",
+		"BaseThreadInitThunk",
+		"RtlUserThreadStart"
 	};
 	
 	SYMBOL_INFO StackInfo = {0};
-	int SameLua = 0;
-	
+
 	for (int Depth = 0; Depth < 64; ++Depth)
 	{
 		if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, Process, ThreadHandle, &StackFrame64, &Context, nullptr,
 		                 SymFunctionTableAccess64,
 		                 SymGetModuleBase64, nullptr))
 		{
-			continue;
+			break;
 		}
 
 		memset(&StackInfo, 0, sizeof(StackInfo));
@@ -273,86 +311,72 @@ static void DoStackWork(HANDLE Process, HANDLE ThreadHandle, CONTEXT &Context, s
 		{
 			continue;
 		}
+
+		if (Ignored.find(Symbol->Name) != Ignored.end())
+		{
+			continue;
+		}
 		
+		if (StartsWith(Symbol->Name, {"lua_", "luaopen_"}))
+		{
+			if (Stacks.size() > 0 && Stacks.back() != &None)
+			{
+				Stacks.push(&None);
+			}
+			continue;
+		}
 		BOOL bLineFromAddr64 = SymGetLineFromAddr64(Process, StackFrame64.AddrPC.Offset, &DisplacementLine, &Line);
 		Stack* St = Alloc();
 		St->functionName = Symbol->Name;
 		St->file = "[unknown]";
-		if (bLineFromAddr64 && !HasIndexOf(Line.FileName, "\\emmy_core\\"))
+		if (bLineFromAddr64)
 		{
-			if (EndsWith(Line.FileName, {".cpp", ".h", ".hpp", ".inl", ".c",}))
-			{
-				if (SameLua % 2 == 0)
-				{
-					Stack* StCall = Alloc();
-					StCall->file = "[lua-vm] ";
-					StCall->functionName = "C/C++ call Lua";
-					Stacks.push_back(StCall);
-					++SameLua;
-				}
-			}
-			else if (EndsWith(Line.FileName, {".lua"}))
-			{
-				if (SameLua % 2 == 1)
-				{
-					Stack* StCall = Alloc();
-					StCall->file = "[ lua-vm] ";
-					StCall->functionName = "Lua call C/C++";
-					Stacks.push_back(StCall);
-					++SameLua;
-				}
-			}
-			
 			St->file = Line.FileName;
 			St->line = Line.LineNumber;
 		}
-		Stacks.push_back(St);
+		Stacks.push(St);
 	}
-
-	SymCleanup(Process);
 }
 
-static void GetUeTraceStackInGameThread(HANDLE Process, HANDLE ThreadHandle, DWORD ThreadID, std::vector<Stack*>& Stacks, StackAllocatorCB Alloc)
+static void GetUeTraceStack(std::queue<Stack*>& Stacks, StackAllocatorCB Alloc)
 {
+	InitSymbol();
+	const HANDLE CurrentThread = GetCurrentThread();
+	HANDLE UeMainThread = nullptr;
 	CONTEXT Context = {};
-	Context.ContextFlags = CONTEXT_CONTROL;
-	if (!GetThreadContext(ThreadHandle, &Context))
-	{
-		return;
-	}
+	memset(&Context, 0, sizeof(Context));
 	
-	DoStackWork(Process, ThreadHandle, Context, Stacks, Alloc);
-}
-
-static void GetUeTraceStack(std::vector<Stack*>& Stacks, StackAllocatorCB Alloc)
-{
-	extern volatile DWORD UeMainThreadID;
-	extern volatile HANDLE UeMainProcess;
-	InitSymbol(UeMainProcess);
 	if (UeMainThreadID == GetCurrentThreadId())
 	{
-		GetUeTraceStackInGameThread(UeMainProcess, GetCurrentThread(), GetCurrentThreadId(), Stacks, Alloc);
-		return;
+		UeMainThread = CurrentThread;
+		RtlCaptureContext(&Context);
 	}
-	const HANDLE UeMainHandle = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_TERMINATE | THREAD_SUSPEND_RESUME, false, UeMainThreadID);
-	if (UeMainHandle)
+	else
 	{
-		SuspendThread(UeMainHandle);
-		CONTEXT ThreadContext = {};
-		ThreadContext.ContextFlags = CONTEXT_CONTROL;
-		if (!GetThreadContext(UeMainHandle, &ThreadContext))
-		{
-			return;
-		}
-		DoStackWork(UeMainProcess, UeMainHandle, ThreadContext, Stacks, Alloc);
-		ResumeThread(UeMainHandle);
-		CloseHandle(UeMainHandle);
+		UeMainThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_TERMINATE | THREAD_SUSPEND_RESUME, false, UeMainThreadID);
+		SuspendThread(UeMainThread);
+		GetThreadContext(UeMainThread, &Context);
 	}
+	
+	DoStackWalk(UeMainProcess, UeMainThread, Context, Stacks, Alloc);
+	if (CurrentThread != UeMainThread)
+	{
+		ResumeThread(UeMainThread);
+		CloseHandle(UeMainThread);
+	}
+}
+
+static bool IsCxxFunction(const std::string &Name)
+{
+	return Name == "=[C]";
 }
 
 bool Debugger::GetStacks(lua_State* L, std::vector<Stack*>& stacks, StackAllocatorCB alloc) {
+	std::queue<Stack*> CxxStacks;
+	GetUeTraceStack(CxxStacks, alloc);
 	int level = 0;
-	while (true) {
+	while (true)
+	{
 		lua_Debug ar{};
 		if (!lua_getstack(L, level, &ar)) {
 			break;
@@ -360,11 +384,39 @@ bool Debugger::GetStacks(lua_State* L, std::vector<Stack*>& stacks, StackAllocat
 		if (!lua_getinfo(L, "nSlu", &ar)) {
 			continue;
 		}
+		const std::string FileName = GetFile(L, &ar);
+		if (IsCxxFunction(FileName))
+		{
+			{
+				auto* stack = alloc();
+				stack->file = "[C->Lua]";
+				stack->functionName = "lua_pcall";
+				stack->line = -1;
+				stacks.push_back(stack);
+			}
+			do
+			{
+				Stack* front = CxxStacks.front();
+				if (front == &None)
+				{
+					CxxStacks.pop();
+					break;
+				}
+				stacks.push_back(front);
+				CxxStacks.pop();
+			}
+			while (!CxxStacks.empty());
+			
+		}
 		auto* stack = alloc();
 		stack->file = GetFile(L, &ar);
 		stack->functionName = getDebugName(&ar) == nullptr ? "" : getDebugName(&ar);
 		stack->level = level;
 		stack->line = getDebugCurrentLine(&ar);
+		if (IsCxxFunction(FileName))
+		{
+			stack->file = "[Lua->C]";
+		}
 		stacks.push_back(stack);
 		// get variables
 		{
@@ -409,7 +461,29 @@ bool Debugger::GetStacks(lua_State* L, std::vector<Stack*>& stacks, StackAllocat
 		level++;
 	}
 
-	GetUeTraceStack(stacks, alloc);
+	if (!CxxStacks.empty())
+	{
+		{
+			auto* stack = alloc();
+			stack->file = "[C->Lua]";
+			stack->functionName = "lua_pcall";
+			stack->line = -1;
+			stacks.push_back(stack);
+		}
+		while (!CxxStacks.empty())
+		{
+			Stack * stack = CxxStacks.front();
+			if (stack == &None)
+			{
+				stack = alloc();
+				stack->file = "[C->Lua]";
+				stack->functionName = "lua_pcall";
+				stack->line = -1;
+			}
+			stacks.push_back(stack);
+			CxxStacks.pop();
+		}
+	}
 	return false;
 }
 

@@ -15,17 +15,11 @@
 */
 #include "emmy_core.h"
 #include "emmy_facade.h"
-#include <Windows.h>
-#include <DbgHelp.h>
+#include "proto/pipeline_client_transporter.h"
 int luaopen_emmy_helper(lua_State* L);
-
-volatile DWORD UeMainThreadID = 0;
-volatile HANDLE UeMainProcess = nullptr;
 
 // emmy.tcpListen(host: string, port: int): bool
 int tcpListen(struct lua_State* L) {
-	UeMainThreadID = GetCurrentThreadId();
-	UeMainProcess = GetCurrentProcess();
 	luaL_checkstring(L, 1);
 	std::string err;
 	const auto host = lua_tostring(L, 1);
